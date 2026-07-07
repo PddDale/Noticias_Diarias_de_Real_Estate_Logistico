@@ -104,15 +104,13 @@ except ImportError:
 
 try:
     from bs4 import BeautifulSoup
-    _HAS_BS4 = True
 except ImportError:
-    _HAS_BS4 = False
+    BeautifulSoup = None  # type: ignore[assignment]
 
 try:
     import yfinance as yf
-    _HAS_YF = True
 except ImportError:
-    _HAS_YF = False
+    yf = None  # type: ignore[assignment]
 
 # 'pandas' é carregado sob demanda (lazy) via yfinance mais abaixo.
 
@@ -400,7 +398,7 @@ def limpar_html(texto: str) -> str:
     """Remove tags HTML e normaliza espaços de uma descrição de RSS."""
     if not texto:
         return ""
-    if _HAS_BS4:
+    if BeautifulSoup is not None:
         texto = BeautifulSoup(texto, "html.parser").get_text(" ")
     else:
         texto = re.sub(r"<[^>]+>", " ", texto)
@@ -729,7 +727,7 @@ def puxar_sgs() -> list[Indicador]:
 def puxar_indices_yf() -> list[Indicador]:
     """Puxa índices via yfinance com histórico de 2 anos. Isolado por índice."""
     indicadores: list[Indicador] = []
-    if not _HAS_YF:
+    if yf is None:
         log.warning("yfinance ausente -> índices de bolsa omitidos. (pip install yfinance)")
         return indicadores
     for nome, ticker in YF_INDICES.items():
@@ -744,7 +742,9 @@ def puxar_indices_yf() -> list[Indicador]:
                 indicadores.append(base_ind())
                 continue
             fechamentos = hist["Close"].dropna()
-            historico = [(idx.strftime("%Y-%m-%d"), float(v)) for idx, v in fechamentos.items()]
+            # idx é um pandas.Timestamp (DatetimeIndex); os stubs o tipam como Hashable.
+            historico = [(idx.strftime("%Y-%m-%d"), float(v))  # type: ignore[attr-defined]
+                         for idx, v in fechamentos.items()]
             atual = historico[-1][1]
             ind = Indicador(nome, _valor_txt(atual, "pts", 0), sufixo="pts", casas=0,
                             fonte=fonte, fonte_url=fonte_url, historico=historico)
