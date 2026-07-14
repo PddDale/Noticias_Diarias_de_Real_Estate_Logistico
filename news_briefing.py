@@ -13,7 +13,10 @@ A cada execução o script:
      confiáveis + Google News RSS por tema).
   2. Filtra pelas últimas 24-36h, deduplica e rankeia por relevância (peso de keywords).
   3. Resume cada matéria a partir da descrição do próprio feed RSS.
-  4. Puxa painel macro BR (BCB/SGS: Selic, CDI, IPCA, câmbio, IGP-M; yfinance: Ibovespa, IFIX).
+  4. Puxa painel macro BR (BCB/SGS: Selic, CDI, IPCA, Dólar Comercial, IGP-M;
+     AwesomeAPI: Dólar Turismo; yfinance: Ibovespa, IFIX). Se o SGS do BCB
+     falhar, cai automaticamente para uma fonte alternativa (AwesomeAPI para
+     câmbio, BrasilAPI para Selic/CDI/IPCA) e identifica isso na fonte exibida.
   5. Gera um HTML estilizado e autossuficiente em ./briefings/briefing_AAAA-MM-DD.html.
 
 ---------------------------------------------------------------------------
@@ -306,21 +309,52 @@ VEICULOS_GLOBAIS_VIA_GOOGLE = {
 #            comparável à Selic meta -> era a causa do valor de CDI aparecer errado.
 #   433   -> IPCA - variação mensal (%)
 #   13522 -> IPCA - acumulado em 12 meses (%)
-#   1     -> Taxa de câmbio - Dólar americano (venda) - diária (R$/US$)
-#   10813 -> Taxa de câmbio - Dólar americano (compra) - diária (R$/US$)
+#   1     -> Taxa de câmbio - Dólar americano comercial (venda) - diária (R$/US$)
 #   189   -> IGP-M - variação mensal (%)
+#
+# OBS. sobre câmbio: "compra" (10813) e "venda" (1) do dólar comercial no SGS
+# são praticamente idênticos (spread de poucos centavos) -> não faz sentido exibir
+# os dois como se fossem indicadores distintos. Por isso o painel mostra só o
+# "Dólar Comercial" (código 1, venda) e, separadamente, o "Dólar Turismo" (dólar
+# em espécie vendido por casas de câmbio, que embute IOF de 3,5% sobre compra de
+# moeda em espécie + spread/corretagem da instituição sobre o comercial) -> o SGS
+# do BCB não publica essa série, então ela vem direto da AwesomeAPI (ver
+# `puxar_dolar_turismo`).
 SGS_SERIES: dict[str, dict] = {
     "Selic (meta a.a.)":      {"codigo": 432,   "sufixo": "%",  "casas": 2, "periodicidade": "diaria"},
     "CDI (a.a.)":             {"codigo": 4389,  "sufixo": "%",  "casas": 2, "periodicidade": "diaria"},
     "IPCA (mês)":             {"codigo": 433,   "sufixo": "%",  "casas": 2, "periodicidade": "mensal"},
     "IPCA (12m acum.)":       {"codigo": 13522, "sufixo": "%",  "casas": 2, "periodicidade": "mensal"},
-    "USD/BRL (compra)":       {"codigo": 10813, "sufixo": "R$", "casas": 2, "periodicidade": "diaria"},
-    "USD/BRL (venda)":        {"codigo": 1,     "sufixo": "R$", "casas": 2, "periodicidade": "diaria"},
+    "Dólar Comercial":        {"codigo": 1,     "sufixo": "R$", "casas": 2, "periodicidade": "diaria"},
     "IGP-M (mês)":            {"codigo": 189,   "sufixo": "%",  "casas": 2, "periodicidade": "mensal"},
 }
 
 # Quantos pontos históricos puxar por periodicidade para cobrir ~24 meses de gráfico.
 N_HISTORICO = {"diaria": 560, "mensal": 26}
+
+# --- Fontes alternativas (fallback quando o SGS do BCB falha) ----------------
+# O SGS costuma cair com erro 400/timeout esporadicamente (WAF do gov.br, série
+# fora da janela de 10 anos, instabilidade pontual). Depois das 2 tentativas já
+# feitas por `_buscar_serie_sgs` (janela de datas + endpoint /ultimos), cada
+# série tenta uma fonte alternativa antes de desistir e mostrar "—":
+#   - Dólar Comercial -> AwesomeAPI (câmbio; histórico diário, mesmo dado de
+#     mercado que o BCB usa como referência).
+#   - Selic / CDI / IPCA (12m) -> BrasilAPI (agrega taxas oficiais do BCB/IBGE);
+#     só devolve o valor mais recente, sem histórico completo.
+# IGP-M e IPCA (mês) não têm fonte gratuita alternativa equivalente conhecida;
+# se o SGS falhar para essas duas, o indicador permanece "—" como antes.
+AWESOME_API_HEADERS = {"User-Agent": "news-briefing/1.0 (+requests)"}
+AWESOME_API_TIMEOUT = 15
+AWESOME_API_MAX_DIAS = 360  # limite da AwesomeAPI para o endpoint /daily
+
+BRASILAPI_TAXAS_URL = "https://brasilapi.com.br/api/taxas/v1"
+BRASILAPI_TIMEOUT = 15
+# Mapeia nome do indicador -> nome da taxa equivalente na BrasilAPI.
+BRASILAPI_FALLBACK_NOMES = {
+    "Selic (meta a.a.)": "Selic",
+    "CDI (a.a.)": "CDI",
+    "IPCA (12m acum.)": "IPCA",
+}
 
 # --- Índices via yfinance ----------------------------------------------------
 YF_INDICES: dict[str, str] = {
@@ -669,8 +703,57 @@ def _buscar_serie_sgs(cod: int, meses: int) -> list[tuple[str, float]]:
     return []
 
 
+def _buscar_cambio_awesomeapi(par: str, dias: int = AWESOME_API_MAX_DIAS) -> list[tuple[str, float]]:
+    """Histórico diário de câmbio via AwesomeAPI (economia.awesomeapi.com.br).
+
+    Usada como (a) fallback do Dólar Comercial quando o SGS do BCB falha, e
+    (b) fonte primária do Dólar Turismo, que o SGS não publica. `par` é o
+    código do par de moedas na AwesomeAPI (ex.: 'USD-BRL' comercial,
+    'USD-BRLT' turismo). Usa o campo 'ask' (venda), equivalente ao "venda"
+    do SGS/à cotação que um comprador de dólares efetivamente paga.
+    Limite da API: 360 dias por chamada -> não cobre os 24m do gráfico padrão,
+    mas é o melhor disponível quando a fonte principal está indisponível.
+    """
+    dias = min(dias, AWESOME_API_MAX_DIAS)
+    url = f"https://economia.awesomeapi.com.br/json/daily/{par}/{dias}"
+    resp = http_get(url, timeout=AWESOME_API_TIMEOUT, headers=AWESOME_API_HEADERS)
+    if resp is None:
+        return []
+    historico: list[tuple[str, float]] = []
+    try:
+        for pt in reversed(resp.json()):
+            ts, valor = pt.get("timestamp"), pt.get("ask")
+            if ts is None or valor is None:
+                continue
+            iso = dt.datetime.fromtimestamp(int(ts)).date().isoformat()
+            historico.append((iso, float(valor)))
+    except Exception as e:
+        log.error("  [AwesomeAPI FALHA] %s: %s", par, str(e)[:120])
+        return []
+    return historico
+
+
+def _buscar_brasilapi_taxa(nome_taxa: str) -> float | None:
+    """Valor mais recente de Selic/CDI/IPCA via BrasilAPI (agrega dados oficiais
+    do BCB/IBGE). Usada como fallback quando o SGS falha; não tem histórico."""
+    resp = http_get(BRASILAPI_TAXAS_URL, timeout=BRASILAPI_TIMEOUT)
+    if resp is None:
+        return None
+    try:
+        for item in resp.json():
+            if str(item.get("nome", "")).lower() == nome_taxa.lower():
+                return float(item["valor"])
+    except Exception as e:
+        log.error("  [BrasilAPI FALHA] %s: %s", nome_taxa, str(e)[:120])
+    return None
+
+
 def puxar_sgs() -> list[Indicador]:
-    """Puxa séries do SGS/BCB com histórico (~24m). Cada série é isolada."""
+    """Puxa séries do SGS/BCB com histórico (~24m). Cada série é isolada.
+
+    Quando o SGS falha (após as 2 tentativas de `_buscar_serie_sgs`), tenta uma
+    fonte alternativa (AwesomeAPI para câmbio, BrasilAPI para Selic/CDI/IPCA
+    12m) antes de desistir e marcar o indicador como "—"."""
     indicadores: list[Indicador] = []
     hoje = dt.date.today()
     di_24m = (hoje - dt.timedelta(days=24 * 31)).strftime("%d/%m/%Y")
@@ -688,8 +771,24 @@ def puxar_sgs() -> list[Indicador]:
                                      fonte=fonte, fonte_url=fonte_url)
         try:
             historico = _buscar_serie_sgs(cod, meses=24)
+
+            if not historico and cod == 1:
+                log.warning("  [SGS %5s] %-18s sem dados -> tentando fallback AwesomeAPI", cod, nome)
+                historico = _buscar_cambio_awesomeapi("USD-BRL")
+                if historico:
+                    fonte = "AwesomeAPI (fallback câmbio)"
+                    fonte_url = "https://economia.awesomeapi.com.br/json/daily/USD-BRL/360"
+
+            elif not historico and nome in BRASILAPI_FALLBACK_NOMES:
+                log.warning("  [SGS %5s] %-18s sem dados -> tentando fallback BrasilAPI", cod, nome)
+                valor_alt = _buscar_brasilapi_taxa(BRASILAPI_FALLBACK_NOMES[nome])
+                if valor_alt is not None:
+                    historico = [(hoje.isoformat(), valor_alt)]
+                    fonte = "BrasilAPI (fallback)"
+                    fonte_url = BRASILAPI_TAXAS_URL
+
             if not historico:
-                log.warning("  [SGS %5s] %-18s sem dados (400/vazio) -> '—'", cod, nome)
+                log.warning("  [SGS %5s] %-18s sem dados (BCB e fallback falharam) -> '—'", cod, nome)
                 indicadores.append(base_ind())
                 time.sleep(BCB_PAUSA)
                 continue
@@ -722,6 +821,41 @@ def puxar_sgs() -> list[Indicador]:
             indicadores.append(base_ind())
         time.sleep(BCB_PAUSA)   # cortesia com o servidor entre séries
     return indicadores
+
+
+def puxar_dolar_turismo() -> Indicador:
+    """Dólar Turismo: cotação de moeda em espécie vendida por casas de câmbio,
+    já embutindo o IOF de 3,5% sobre compra de moeda em espécie + o spread/
+    corretagem normal da instituição sobre o dólar comercial (por isso o valor
+    fica destacadamente mais caro que o "Dólar Comercial" do SGS, ao invés de
+    mostrar praticamente o mesmo número). Não existe série equivalente no SGS
+    do BCB -> a AwesomeAPI é a fonte primária (não um fallback)."""
+    nome = "Dólar Turismo"
+    fonte = "AwesomeAPI (câmbio turismo)"
+    fonte_url = "https://economia.awesomeapi.com.br/json/daily/USD-BRLT/360"
+    try:
+        historico = _buscar_cambio_awesomeapi("USD-BRLT")
+        if not historico:
+            log.warning("  [Dólar Turismo] sem dados (AwesomeAPI) -> '—'")
+            return Indicador(nome, "—", sufixo="R$", casas=2, fonte=fonte, fonte_url=fonte_url)
+
+        ultimo = historico[-1][1]
+        data_ref = _iso_to_br(historico[-1][0])
+        ind = Indicador(nome, _valor_txt(ultimo, "R$", 2), sufixo="R$", casas=2,
+                        fonte=fonte, fonte_url=fonte_url, historico=historico)
+        if len(historico) >= 2:
+            anterior = historico[-2][1]
+            if anterior:
+                var = (ultimo - anterior) / anterior * 100
+                ind.variacao = f"{'+' if var >= 0 else ''}{_fmt_num(var, 2)}%"
+                ind.direcao = 1 if var > 0 else (-1 if var < 0 else 0)
+        if data_ref:
+            ind.variacao = (ind.variacao + f" · {data_ref}").strip(" ·")
+        log.info("  [Dólar Turismo] %s (%d pts)", ind.valor, len(historico))
+        return ind
+    except Exception as e:
+        log.error("  [Dólar Turismo FALHA] %s", str(e)[:120])
+        return Indicador(nome, "—", sufixo="R$", casas=2, fonte=fonte, fonte_url=fonte_url)
 
 
 def puxar_indices_yf() -> list[Indicador]:
@@ -764,7 +898,14 @@ def puxar_indices_yf() -> list[Indicador]:
 
 def montar_painel_macro() -> list[Indicador]:
     log.info("Puxando painel macroeconômico…")
-    return puxar_sgs() + puxar_indices_yf()
+    sgs = puxar_sgs()
+    # Insere o Dólar Turismo logo após o Dólar Comercial (mesma vizinhança temática).
+    try:
+        idx = next(i for i, ind in enumerate(sgs) if ind.nome == "Dólar Comercial")
+        sgs.insert(idx + 1, puxar_dolar_turismo())
+    except StopIteration:
+        sgs.append(puxar_dolar_turismo())
+    return sgs + puxar_indices_yf()
 
 
 # =============================================================================
@@ -1180,10 +1321,15 @@ def gerar_html(materias: list[Materia], macro: list[Indicador], hoje: dt.date) -
     <footer>
       Gerado automaticamente em {gerado_em} · {total_manchetes} manchetes · janela de {JANELA_HORAS}h.<br>
       <strong>Fontes dos dados macroeconômicos:</strong>
-      indicadores de juros, inflação e câmbio (Selic, CDI, IPCA, IGP-M, USD/BRL) do
+      indicadores de juros, inflação e câmbio comercial (Selic, CDI, IPCA, IGP-M, Dólar Comercial) do
       <a href="https://www3.bcb.gov.br/sgspub/" target="_blank" rel="noopener">Banco Central do Brasil — Sistema Gerenciador de Séries Temporais (SGS)</a>;
+      dólar turismo (cotação de moeda em espécie, já com IOF e spread da instituição) da
+      <a href="https://docs.awesomeapi.com.br/api-de-moedas" target="_blank" rel="noopener">AwesomeAPI</a>;
       índices de bolsa (Ibovespa, IFIX) do
       <a href="https://finance.yahoo.com/" target="_blank" rel="noopener">Yahoo Finance</a>.
+      Se a base do BCB falhar, o painel usa automaticamente uma fonte alternativa
+      (AwesomeAPI para câmbio; <a href="https://brasilapi.com.br/" target="_blank" rel="noopener">BrasilAPI</a>
+      para Selic/CDI/IPCA) e sinaliza isso no rótulo de fonte do indicador.
       Notícias coletadas via RSS de veículos econômicos, fontes globais de
       reputação estabelecida (BBC, The Guardian, Al Jazeera, ONU, NPR,
       Deutsche Welle, Reuters, Associated Press) e Google News.

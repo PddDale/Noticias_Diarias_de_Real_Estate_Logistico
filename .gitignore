@@ -1,7 +1,5 @@
-briefings/briefing_2026-07-06.html
-briefings/briefing_2026-07-07.html
-briefings/.cache/briefing_2026-07-06.json
-briefings/.cache/briefing_2026-07-04.json
-briefings/.cache/briefing_2026-07-07.json
-.vscode/settings.json
-__pycache__/news_briefing.cpython-314.pyc
+briefings/
+.vscode/
+__pycache__/
+.venv/
+.gitignore
