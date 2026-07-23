@@ -18,6 +18,9 @@ A cada execução o script:
      falhar, cai automaticamente para uma fonte alternativa (AwesomeAPI para
      câmbio, BrasilAPI para Selic/CDI/IPCA) e identifica isso na fonte exibida.
   5. Gera um HTML estilizado e autossuficiente em ./briefings/briefing_AAAA-MM-DD.html.
+  6. (Opcional, requer ANTHROPIC_API_KEY) Usa a IA da Anthropic (Claude Haiku)
+     para aprimorar os resumos das notícias e gerar uma breve análise de
+     tendência para cada indicador macro, exibida ao clicar no card dele.
 
 ---------------------------------------------------------------------------
 INSTALAÇÃO DAS DEPENDÊNCIAS (rodar uma vez no terminal / venv):
@@ -27,6 +30,17 @@ INSTALAÇÃO DAS DEPENDÊNCIAS (rodar uma vez no terminal / venv):
 Observações:
   - 'beautifulsoup4' é usado apenas para limpar HTML das descrições dos feeds.
   - 'yfinance' é opcional: sem a lib, os índices de bolsa são omitidos.
+
+INTEGRAÇÃO COM IA (OPCIONAL):
+  Para habilitar resumos e análises geradas por IA, instale a lib oficial e
+  defina a chave da API da Anthropic como variável de ambiente:
+
+    pip install anthropic
+    setx ANTHROPIC_API_KEY "sk-ant-..."      (Windows, persiste entre sessões)
+    $env:ANTHROPIC_API_KEY = "sk-ant-..."    (Windows, só a sessão atual)
+    export ANTHROPIC_API_KEY="sk-ant-..."    (Linux/Mac)
+
+  Sem a chave, o script roda normalmente sem IA (comportamento atual).
 ---------------------------------------------------------------------------
 """
 
@@ -60,7 +74,6 @@ _PACOTES_NECESSARIOS = [
     ("yfinance", "yfinance"),
     ("bs4", "beautifulsoup4"),
 ]
-
 
 def _garantir_dependencias(forcar_upgrade: bool = False) -> None:
     """Instala automaticamente os pacotes ausentes via pip. Com `forcar_upgrade=True`
@@ -136,6 +149,45 @@ HTTP_BACKOFF = 2.0                     # fator de backoff exponencial
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0 Safari/537.36 NewsBriefing/1.0")
+
+# --- Integração com IA (Claude) — OPCIONAL -----------------------------------
+# Para habilitar (1) resumos de notícias mais informativos e (2) uma análise
+# textual da tendência de cada indicador macro (exibida ao clicar no card),
+# defina a variável de ambiente ANTHROPIC_API_KEY com uma chave da API da
+# Anthropic e instale a lib oficial: `pip install anthropic`.
+#
+#   Windows (PowerShell):  $env:ANTHROPIC_API_KEY = "sk-ant-..."
+#   Linux/Mac (bash):      export ANTHROPIC_API_KEY="sk-ant-..."
+#
+# Sem a chave definida, o script funciona normalmente como hoje (resumo a
+# partir da descrição do RSS, sem análise de IA nos indicadores) — nada é
+# quebrado e nenhuma chamada de rede extra é feita.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+IA_MODELO = "claude-haiku-4-5"          # rápido e barato; ideal para resumo/análise curta
+IA_HABILITADA = bool(ANTHROPIC_API_KEY)
+TAMANHO_LOTE_IA = 25                    # matérias por chamada de resumo (permite checkpoint incremental)
+
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+    if IA_HABILITADA:
+        print("[setup] AVISO: ANTHROPIC_API_KEY definida, mas a lib 'anthropic' não "
+              "está instalada. Rode: pip install anthropic. Seguindo sem IA.")
+        IA_HABILITADA = False
+
+_cliente_ia_singleton = None
+
+
+def _cliente_ia():
+    """Cria (uma única vez) e devolve o client da Anthropic, ou None se a IA
+    estiver desabilitada/indisponível."""
+    global _cliente_ia_singleton
+    if not IA_HABILITADA or anthropic is None:
+        return None
+    if _cliente_ia_singleton is None:
+        _cliente_ia_singleton = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _cliente_ia_singleton
 
 # A API do BCB (WAF do gov.br) rejeita com 400 requisições que se passam por
 # navegador sem os demais headers de browser. Usamos User-Agent "honesto" +
@@ -609,11 +661,156 @@ def resumir_materia(m: Materia) -> str:
     return truncar(m.descricao or m.titulo, 300)
 
 
-def sumarizar_todas(materias: list[Materia]) -> None:
-    """Preenche o campo `resumo` de cada matéria com o texto da descrição do RSS."""
+def sumarizar_todas(materias: list[Materia], checkpoint: dict | None = None,
+                     hoje: dt.date | None = None) -> None:
+    """Preenche o campo `resumo` de cada matéria com o texto da descrição do RSS.
+
+    Se ANTHROPIC_API_KEY estiver definida, tenta em seguida melhorar esses
+    resumos via IA (`resumir_com_ia`); qualquer falha mantém o resumo do RSS.
+    `checkpoint`/`hoje`, quando informados, permitem retomar resumos de IA já
+    gerados numa execução anterior que falhou no meio (ver seção 11b)."""
     log.info("Montando resumos de %d matérias (descrição do RSS)…", len(materias))
     for m in materias:
         m.resumo = resumir_materia(m)
+    if IA_HABILITADA:
+        resumir_com_ia(materias, checkpoint=checkpoint, hoje=hoje)
+
+
+def resumir_com_ia(materias: list[Materia], checkpoint: dict | None = None,
+                    hoje: dt.date | None = None) -> bool:
+    """Gera resumos mais informativos via IA (Claude Haiku), a partir do
+    título + descrição de cada matéria. Substitui `m.resumo` só quando a
+    chamada é bem-sucedida; em qualquer erro (rede, parsing, chave inválida
+    etc.) mantém o resumo já preenchido a partir do RSS e não lança exceção.
+    Retorna True se ao menos um resumo foi obtido via IA (nesta execução ou
+    recuperado do checkpoint).
+
+    Processa em lotes de `TAMANHO_LOTE_IA` itens; a cada lote bem-sucedido,
+    salva o progresso em `checkpoint` (se informado) — assim, se a execução
+    for interrompida no meio (rede cai, processo é encerrado etc.), a próxima
+    rodada no mesmo dia recupera do checkpoint os resumos já gerados e chama
+    a IA apenas para o que faltar, em vez de reprocessar tudo do zero.
+
+    OBS. de custo: processa todas as matérias recebidas (já filtradas/rankeadas
+    pelas etapas anteriores). Para limitar custo/latência em bases muito
+    grandes, ajuste `MAX_MANCHETES_POR_TEMA` ou passe um subconjunto aqui."""
+    if not materias:
+        return False
+
+    cache_resumos = checkpoint.setdefault("resumos_ia", {}) if checkpoint is not None else {}
+
+    # Aplica resumos já cacheados (retomada de execução anterior) e isola o
+    # que ainda falta gerar.
+    faltando: list[Materia] = []
+    recuperados = 0
+    for m in materias:
+        cache_hit = cache_resumos.get(m.chave)
+        if cache_hit:
+            m.resumo = cache_hit
+            recuperados += 1
+        else:
+            faltando.append(m)
+
+    if recuperados:
+        log.info("  [IA] %d/%d resumos recuperados do checkpoint (execução anterior)",
+                  recuperados, len(materias))
+
+    if not faltando:
+        return recuperados > 0
+
+    client = _cliente_ia()
+    if client is None:
+        return recuperados > 0
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "resumos": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": ("Um resumo por item de entrada, na mesma ordem e "
+                                 "quantidade da lista recebida, em português do Brasil, "
+                                 "~2 frases, objetivo e factual."),
+            }
+        },
+        "required": ["resumos"],
+        "additionalProperties": False,
+    }
+
+    gerados = 0
+    for inicio in range(0, len(faltando), TAMANHO_LOTE_IA):
+        lote = faltando[inicio:inicio + TAMANHO_LOTE_IA]
+        itens = [{"titulo": m.titulo, "descricao": truncar(m.descricao, 500)} for m in lote]
+        try:
+            resp = client.messages.create(
+                model=IA_MODELO,
+                max_tokens=4000,
+                system=("Você resume manchetes de notícias de mercado financeiro, real "
+                         "estate logístico/industrial e economia para um briefing executivo "
+                         "em português do Brasil. Cada resumo deve ter ~2 frases, ser objetivo "
+                         "e factual, e não inventar informação além do título/descrição dados."),
+                messages=[{"role": "user", "content": json.dumps(itens, ensure_ascii=False)}],
+                output_config={"format": {"type": "json_schema", "schema": schema}},
+            )
+            texto = next(b.text for b in resp.content if b.type == "text")
+            resumos = json.loads(texto)["resumos"]
+            if len(resumos) != len(lote):
+                raise ValueError(f"esperado {len(lote)} resumos, recebido {len(resumos)}")
+            for m, r in zip(lote, resumos):
+                r = r.strip()
+                if r:
+                    resumo_final = truncar(r, 400)
+                    m.resumo = resumo_final
+                    cache_resumos[m.chave] = resumo_final
+            gerados += len(lote)
+            # Salva assim que o lote é concluído -> se um lote seguinte falhar
+            # (ou o processo for interrompido), este progresso não se perde.
+            if checkpoint is not None and hoje is not None:
+                salvar_checkpoint_ia(hoje, checkpoint)
+        except Exception as e:
+            log.warning("  [IA] falha ao gerar resumos do lote %d–%d de %d (%s) -> "
+                        "mantendo resumo do RSS para este lote",
+                        inicio + 1, inicio + len(lote), len(faltando), str(e)[:150])
+            continue
+
+    log.info("  [IA] %d resumos gerados via %s (%d recuperados de checkpoint)",
+              gerados, IA_MODELO, recuperados)
+    return (gerados + recuperados) > 0
+
+
+def analisar_indicador_com_ia(ind: "Indicador") -> str:
+    """Gera uma análise textual curta (2-3 frases) da tendência recente de um
+    indicador macro via IA (Claude Haiku), exibida no modal de histórico ao
+    clicar no card do indicador no painel. Retorna string vazia em qualquer
+    falha (histórico insuficiente, rede, chave inválida etc.) — nunca lança
+    exceção nem impede a geração do restante do relatório."""
+    if len(ind.historico) < 2:
+        return ""
+    client = _cliente_ia()
+    if client is None:
+        return ""
+    pontos = ind.historico[-12:]
+    serie_txt = "; ".join(f"{d}: {v}" for d, v in pontos)
+    try:
+        resp = client.messages.create(
+            model=IA_MODELO,
+            max_tokens=300,
+            system=("Você é um analista macroeconômico focado no mercado brasileiro de "
+                     "real estate logístico/industrial. Dado um indicador e sua série "
+                     "histórica recente, escreva uma análise curta (2-3 frases, português "
+                     "do Brasil) sobre a tendência observada e o que ela pode sinalizar "
+                     "para esse mercado. Seja objetivo e não especule além do que os "
+                     "dados sugerem."),
+            messages=[{"role": "user", "content": (
+                f"Indicador: {ind.nome} ({ind.sufixo})\n"
+                f"Últimos valores (data: valor): {serie_txt}"
+            )}],
+        )
+        texto = next((b.text for b in resp.content if b.type == "text"), "").strip()
+        return truncar(texto, 500)
+    except Exception as e:
+        log.warning("  [IA] falha ao analisar indicador %s (%s)", ind.nome, str(e)[:150])
+        return ""
 
 
 # =============================================================================
@@ -630,6 +827,7 @@ class Indicador:
     fonte: str = ""                 # rótulo curto da fonte
     fonte_url: str = ""             # link para conferir o dado na origem
     historico: list = field(default_factory=list)  # [(iso_date, valor), ...]
+    analise_ia: str = ""             # análise de tendência gerada por IA (opcional)
 
 
 def _fmt_num(v: float, casas: int = 2) -> str:
@@ -896,7 +1094,10 @@ def puxar_indices_yf() -> list[Indicador]:
     return indicadores
 
 
-def montar_painel_macro() -> list[Indicador]:
+def montar_painel_macro(checkpoint: dict | None = None, hoje: dt.date | None = None) -> list[Indicador]:
+    """`checkpoint`/`hoje`, quando informados, permitem recuperar análises de IA
+    por indicador já geradas numa execução anterior que falhou no meio (ver
+    seção 11b), evitando reprocessar (e pagar de novo) indicadores já feitos."""
     log.info("Puxando painel macroeconômico…")
     sgs = puxar_sgs()
     # Insere o Dólar Turismo logo após o Dólar Comercial (mesma vizinhança temática).
@@ -905,7 +1106,27 @@ def montar_painel_macro() -> list[Indicador]:
         sgs.insert(idx + 1, puxar_dolar_turismo())
     except StopIteration:
         sgs.append(puxar_dolar_turismo())
-    return sgs + puxar_indices_yf()
+    indicadores = sgs + puxar_indices_yf()
+
+    if IA_HABILITADA:
+        cache_ind = checkpoint.setdefault("indicadores_ia", {}) if checkpoint is not None else {}
+        log.info("Gerando análises de tendência via IA (%s)…", IA_MODELO)
+        for ind in indicadores:
+            if len(ind.historico) < 2:
+                continue
+            cache_hit = cache_ind.get(ind.nome)
+            if cache_hit:
+                ind.analise_ia = cache_hit
+                continue
+            ind.analise_ia = analisar_indicador_com_ia(ind)
+            if ind.analise_ia:
+                cache_ind[ind.nome] = ind.analise_ia
+                # Salva a cada indicador -> se a execução for interrompida
+                # logo em seguida, os indicadores já analisados não se perdem.
+                if checkpoint is not None and hoje is not None:
+                    salvar_checkpoint_ia(hoje, checkpoint)
+
+    return indicadores
 
 
 # =============================================================================
@@ -932,6 +1153,75 @@ def limpar_arquivos_antigos(dias: int = RETENCAO_DIAS) -> None:
                     log.info("  [limpeza] removido: %s", arq.name)
             except Exception as e:
                 log.warning("  [limpeza] falha ao remover %s: %s", arq.name, str(e)[:120])
+
+
+# =============================================================================
+# 11b. CHECKPOINT DE IA (retomada após falha no meio da execução)
+# =============================================================================
+# Resumos de notícias e análises de indicadores gerados por IA são caros de
+# refazer (tempo + custo de API). Se a execução for interrompida no meio
+# (queda de rede, processo encerrado, etc.), salvamos o progresso desses dois
+# passos incrementalmente neste checkpoint. Na próxima execução do MESMO DIA,
+# o que já foi gerado é recuperado e a IA só é chamada para o que falta.
+#
+# O checkpoint é identificado pela data (nome do arquivo inclui AAAA-MM-DD) e
+# só faz sentido dentro do dia corrente -- a janela de notícias (JANELA_HORAS)
+# e os indicadores mudam de um dia para o outro. Por isso, diferente da
+# retenção geral (`limpar_arquivos_antigos`, que mantém arquivos por
+# RETENCAO_DIAS dias), checkpoints de dias anteriores ao atual são apagados
+# imediatamente no início de cada execução (`limpar_checkpoints_antigos`),
+# e não após alguns dias.
+def caminho_checkpoint(hoje: dt.date) -> Path:
+    return PASTA_CACHE / f"checkpoint_ia_{hoje.isoformat()}.json"
+
+
+def carregar_checkpoint_ia(hoje: dt.date) -> dict:
+    """Carrega o checkpoint de IA do dia (resumos de notícias e análises de
+    indicadores já geradas em execuções anteriores no mesmo dia). Se não
+    existir ou estiver corrompido, devolve uma estrutura vazia -- nunca lança
+    exceção nem impede a execução de continuar do zero."""
+    caminho = caminho_checkpoint(hoje)
+    if not caminho.exists():
+        return {"resumos_ia": {}, "indicadores_ia": {}}
+    try:
+        dados = json.loads(caminho.read_text(encoding="utf-8"))
+        dados.setdefault("resumos_ia", {})
+        dados.setdefault("indicadores_ia", {})
+        return dados
+    except Exception as e:
+        log.warning("  [checkpoint] falha ao ler checkpoint existente (%s) -> "
+                    "ignorando e começando do zero", str(e)[:120])
+        return {"resumos_ia": {}, "indicadores_ia": {}}
+
+
+def salvar_checkpoint_ia(hoje: dt.date, checkpoint: dict) -> None:
+    """Persiste o checkpoint de IA em disco. Chamado incrementalmente (a cada
+    lote de resumos e a cada indicador analisado) para que o progresso não se
+    perca caso a execução seja interrompida antes do fim. Escreve em um
+    arquivo temporário e troca por `Path.replace` (atômico no mesmo volume)
+    para nunca deixar um checkpoint corrompido/parcial em disco."""
+    try:
+        caminho = caminho_checkpoint(hoje)
+        tmp = caminho.with_suffix(".tmp")
+        tmp.write_text(json.dumps(checkpoint, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(caminho)
+    except Exception as e:
+        log.warning("  [checkpoint] falha ao salvar checkpoint (%s)", str(e)[:120])
+
+
+def limpar_checkpoints_antigos(hoje: dt.date) -> None:
+    """Remove checkpoints de IA de dias anteriores ao atual (ver nota acima
+    sobre por que isso é imediato, e não regido por RETENCAO_DIAS)."""
+    if not PASTA_CACHE.exists():
+        return
+    atual = caminho_checkpoint(hoje).name
+    for arq in PASTA_CACHE.glob("checkpoint_ia_*.json"):
+        if arq.name != atual:
+            try:
+                arq.unlink()
+                log.info("  [checkpoint] removido checkpoint de dia anterior: %s", arq.name)
+            except Exception as e:
+                log.warning("  [checkpoint] falha ao remover %s: %s", arq.name, str(e)[:120])
 
 
 # =============================================================================
@@ -964,10 +1254,11 @@ _CHART_JS = r"""
   const NS = 'http://www.w3.org/2000/svg';
   const state = { key:null, months:MONTHS_DEFAULT };
 
-  const modal   = document.getElementById('modal');
+  const modal    = document.getElementById('modal');
   const elTit    = document.getElementById('modal-titulo');
   const elVal    = document.getElementById('modal-valor');
   const elFonte  = document.getElementById('modal-fonte');
+  const elIA     = document.getElementById('modal-ia');
   const svg      = document.getElementById('chart');
   const ranges   = document.getElementById('ranges');
 
@@ -1103,6 +1394,8 @@ _CHART_JS = r"""
     elFonte.innerHTML = d.sourceUrl
       ? 'Fonte: <a href="'+d.sourceUrl+'" target="_blank" rel="noopener">'+d.source+' ↗</a>'
       : 'Fonte: '+d.source;
+    if (d.analiseIA) { elIA.textContent = d.analiseIA; elIA.style.display = 'block'; }
+    else { elIA.textContent = ''; elIA.style.display = 'none'; }
     ranges.querySelectorAll('button').forEach(b =>
       b.classList.toggle('ativo', Number(b.dataset.m)===state.months));
     drawChart(filtrar(d.series, state.months), d.unit, d.decimals);
@@ -1159,6 +1452,7 @@ def gerar_html(materias: list[Materia], macro: list[Indicador], hoje: dt.date) -
                 "source": ind.fonte,
                 "sourceUrl": ind.fonte_url,
                 "series": [[iso, v] for iso, v in ind.historico],
+                "analiseIA": ind.analise_ia,
             }
             attrs = (f' class="card clicavel" data-key="{html.escape(ind.nome)}"'
                      f' role="button" tabindex="0"'
@@ -1208,6 +1502,11 @@ def gerar_html(materias: list[Materia], macro: list[Indicador], hoje: dt.date) -
     secoes_html = "\n".join(secoes) if secoes else '<p class="vazio">Nenhuma manchete relevante encontrada na janela definida.</p>'
 
     gerado_em = dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+    ia_footer = (
+        " Resumos de notícias e análises de tendência dos indicadores foram "
+        f"aprimorados com apoio de IA ({html.escape(IA_MODELO)})."
+        if IA_HABILITADA else ""
+    )
 
     html_doc = f"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -1272,6 +1571,12 @@ def gerar_html(materias: list[Materia], macro: list[Indicador], hoje: dt.date) -
   .ranges button.ativo {{ background: var(--azul); color: #fff; border-color: var(--azul); }}
   .chart-wrap {{ width: 100%; }}
   .chart-wrap svg {{ width: 100%; height: auto; display: block; }}
+  .modal-ia {{ margin-top: 14px; padding: 12px 14px; background: var(--surface-2);
+    border: 1px solid var(--linha); border-left: 3px solid var(--azul); border-radius: 8px;
+    color: #cdd3dd; font-size: 13.5px; line-height: 1.5; }}
+  .modal-ia::before {{ content: "✨ Análise (IA)"; display: block; font-size: 11px;
+    font-weight: 700; text-transform: uppercase; letter-spacing: .4px; color: var(--azul);
+    margin-bottom: 6px; }}
   .modal-fonte {{ margin-top: 12px; color: var(--neutro); font-size: 12px; }}
   .modal-fonte a {{ color: var(--azul); text-decoration: none; }}
   .modal-fonte a:hover {{ text-decoration: underline; }}
@@ -1333,7 +1638,7 @@ def gerar_html(materias: list[Materia], macro: list[Indicador], hoje: dt.date) -
       Notícias coletadas via RSS de veículos econômicos, fontes globais de
       reputação estabelecida (BBC, The Guardian, Al Jazeera, ONU, NPR,
       Deutsche Welle, Reuters, Associated Press) e Google News.
-      Confira sempre a fonte original antes de decisões.
+      Confira sempre a fonte original antes de decisões.{ia_footer}
     </footer>
   </div>
 
@@ -1355,6 +1660,7 @@ def gerar_html(materias: list[Materia], macro: list[Indicador], hoje: dt.date) -
         <svg id="chart" viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet"
              role="img" aria-label="Gráfico histórico do indicador"></svg>
       </div>
+      <div class="modal-ia" id="modal-ia" style="display:none"></div>
       <div class="modal-fonte" id="modal-fonte"></div>
     </div>
   </div>
@@ -1391,6 +1697,11 @@ def main() -> int:
         limpar_arquivos_antigos()
         return 0
 
+    # Checkpoint de IA: descarta checkpoints de dias anteriores e carrega o de
+    # hoje (se existir, de uma execução interrompida mais cedo no mesmo dia).
+    limpar_checkpoints_antigos(hoje)
+    checkpoint_ia = carregar_checkpoint_ia(hoje)
+
     # 1-2. Coleta + filtro + dedup + ranking
     try:
         brutas = coletar_todas_as_fontes()
@@ -1407,7 +1718,7 @@ def main() -> int:
 
     # 3. Sumarização (nunca derruba o script)
     try:
-        sumarizar_todas(rankeadas)
+        sumarizar_todas(rankeadas, checkpoint=checkpoint_ia, hoje=hoje)
     except Exception as e:
         log.error("Falha na sumarização (seguindo com fallback): %s", e)
         for m in rankeadas:
@@ -1416,7 +1727,7 @@ def main() -> int:
 
     # 4. Painel macro
     try:
-        macro = montar_painel_macro()
+        macro = montar_painel_macro(checkpoint=checkpoint_ia, hoje=hoje)
     except Exception as e:
         log.error("Falha no painel macro: %s", e)
         macro = []
