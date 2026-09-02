@@ -433,6 +433,8 @@ YF_INDICES: dict[str, str] = {
     "Ibovespa": "^BVSP",
     "IFIX":     "IFIX.SA",   # nem sempre disponível no Yahoo; tratado com fallback
 }
+YF_RETRIES = 3    # yf.Ticker().history() é instável (rate-limit/anti-bot do Yahoo);
+YF_BACKOFF = 2.0  # algumas tentativas extras evitam desistir à toa do índice.
 
 
 # =============================================================================
@@ -1087,8 +1089,17 @@ def puxar_indices_yf() -> list[Indicador]:
         fonte_url = f"https://finance.yahoo.com/quote/{ticker}"
         base_ind = lambda: Indicador(nome, "—", sufixo="pts", casas=0,
                                      fonte=fonte, fonte_url=fonte_url)
+        hist = None
         try:
-            hist = yf.Ticker(ticker).history(period="2y")
+            for tentativa in range(YF_RETRIES + 1):
+                hist = yf.Ticker(ticker).history(period="2y")
+                if hist is not None and not hist.empty and "Close" in hist:
+                    break
+                if tentativa < YF_RETRIES:
+                    espera = YF_BACKOFF ** tentativa
+                    log.warning("  [YF] sem dados p/ %s (tentativa %d) | retry em %.1fs",
+                                nome, tentativa + 1, espera)
+                    time.sleep(espera)
             if hist is None or hist.empty or "Close" not in hist:
                 log.warning("  [YF] sem dados para %s (%s)", nome, ticker)
                 indicadores.append(base_ind())
