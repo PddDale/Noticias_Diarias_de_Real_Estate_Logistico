@@ -277,6 +277,26 @@ TEMAS: dict[str, dict] = {
             "SiiLA JLL Cushman Wakefield logística",
         ],
     },
+    "Tecnologia e Inteligência Artificial": {
+        "keywords": {
+            "inteligência artificial": 4, "ia generativa": 4, "artificial intelligence": 4,
+            "generative ai": 4, "machine learning": 3, "aprendizado de máquina": 3,
+            "llm": 4, "modelo de linguagem": 3, "large language model": 4,
+            "chatgpt": 4, "openai": 4, "anthropic": 4, "claude ai": 4, "gemini": 3,
+            "google deepmind": 4, "deepmind": 3, "microsoft copilot": 3, "copilot": 2,
+            "nvidia": 3, "semicondutores": 3, "chips": 2, "data center": 3, "datacenter": 3,
+            "computação em nuvem": 2, "cloud computing": 2, "big tech": 3,
+            "startup de tecnologia": 2, "tecnologia": 1, "robótica": 2, "automação": 2,
+            "realidade virtual": 2, "metaverso": 2, "cibersegurança": 2,
+            "computação quântica": 3, "quantum computing": 3,
+        },
+        "queries": [
+            "inteligência artificial tecnologia",
+            "OpenAI Anthropic Google IA",
+            "IA generativa ChatGPT Gemini Claude",
+            "semicondutores nvidia chips inteligência artificial",
+        ],
+    },
     "Notícias Globais (Política e Relações Internacionais)": {
         "keywords": {
             "geopolítica": 4, "geopolitics": 4, "relações internacionais": 4,
@@ -1252,7 +1272,11 @@ _CHART_JS = r"""
   const C = { linha:'#4c8bf5', area1:'rgba(76,139,245,0.28)', area2:'rgba(76,139,245,0.02)',
               grid:'#2a303c', texto:'#9aa4b2' };
   const NS = 'http://www.w3.org/2000/svg';
-  const state = { key:null, months:MONTHS_DEFAULT };
+  const state = { key:null, months:MONTHS_DEFAULT, customRange:null };
+  // Contexto do arraste de seleção de período, recriado a cada drawChart() e
+  // consumido pelos listeners de window (registrados uma única vez abaixo,
+  // p/ não acumular handlers a cada re-render do gráfico).
+  let dragCtx = null;
 
   const modal    = document.getElementById('modal');
   const elTit    = document.getElementById('modal-titulo');
@@ -1261,6 +1285,7 @@ _CHART_JS = r"""
   const elIA     = document.getElementById('modal-ia');
   const svg      = document.getElementById('chart');
   const ranges   = document.getElementById('ranges');
+  const elClear  = document.getElementById('clear-range');
 
   const fmt = (v, d) => Number(v).toLocaleString('pt-BR',
       { minimumFractionDigits:d, maximumFractionDigits:d });
@@ -1279,13 +1304,21 @@ _CHART_JS = r"""
     return pts.length >= 2 ? pts : series.slice(-2);
   }
 
+  function filtrarRange(series, startIso, endIso) {
+    if (!series.length) return [];
+    const a = new Date(startIso).getTime(), b = new Date(endIso).getTime();
+    const lo = Math.min(a, b), hi = Math.max(a, b);
+    const pts = series.filter(p => { const t = new Date(p[0]).getTime(); return t >= lo && t <= hi; });
+    return pts.length >= 2 ? pts : series.slice(-2);
+  }
+
   function el(tag, attrs) {
     const e = document.createElementNS(NS, tag);
     for (const k in attrs) e.setAttribute(k, attrs[k]);
     return e;
   }
 
-  function drawChart(points, unit, decimals) {
+  function drawChart(points, unit, decimals, onRangeSelect) {
     while (svg.firstChild) svg.removeChild(svg.firstChild);
     const W=720, H=320, mL=64, mR=18, mT=18, mB=42;
     const plotW=W-mL-mR, plotH=H-mT-mB;
@@ -1356,12 +1389,15 @@ _CHART_JS = r"""
     const ov=el('rect',{x:mL,y:mT,width:plotW,height:plotH,fill:'transparent'});
     ov.style.cursor='crosshair'; svg.appendChild(ov);
 
-    function nearest(clientX){
-      const r=svg.getBoundingClientRect();
-      const px=(clientX-r.left)/r.width*W;
+    function nearestPx(px){
       let best=0,bd=Infinity;
       for (let i=0;i<points.length;i++){ const d=Math.abs(sx(xs[i])-px); if(d<bd){bd=d;best=i;} }
       return best;
+    }
+    function nearest(clientX){
+      const r=svg.getBoundingClientRect();
+      const px=(clientX-r.left)/r.width*W;
+      return nearestPx(px);
     }
     function show(clientX){
       const i=nearest(clientX), x=sx(xs[i]), y=sy(ys[i]);
@@ -1380,11 +1416,50 @@ _CHART_JS = r"""
       tip.setAttribute('opacity',1);
     }
     function hide(){ hLine.setAttribute('opacity',0); hDot.setAttribute('opacity',0); tip.setAttribute('opacity',0); }
-    ov.addEventListener('mousemove', e => show(e.clientX));
+    ov.addEventListener('mousemove', e => { if(!dragCtx.dragging) show(e.clientX); });
     ov.addEventListener('mouseleave', hide);
     ov.addEventListener('touchmove', e => { if(e.touches[0]){ show(e.touches[0].clientX); e.preventDefault(); } }, {passive:false});
     ov.addEventListener('touchend', hide);
+
+    // Seleção visual de período: arrastar com o mouse sobre o gráfico dá zoom
+    // no intervalo escolhido. O estado do arraste vive em `dragCtx` (fora desta
+    // função) e é consumido pelos listeners de window registrados uma única vez.
+    const selRect = el('rect', {y:mT, height:plotH, fill:'rgba(76,139,245,0.18)',
+      stroke:C.linha, 'stroke-dasharray':'3 3', opacity:0});
+    svg.appendChild(selRect);
+    function toPlotX(clientX){
+      const r=svg.getBoundingClientRect();
+      const px=(clientX-r.left)/r.width*W;
+      return Math.min(Math.max(px, mL), W-mR);
+    }
+    dragCtx = { dragging:false, startPx:0, selRect, points, nearestPx, onRangeSelect, toPlotX };
+    ov.addEventListener('mousedown', e => {
+      dragCtx.dragging = true;
+      dragCtx.startPx = toPlotX(e.clientX);
+      selRect.setAttribute('x', dragCtx.startPx); selRect.setAttribute('width', 0);
+      selRect.setAttribute('opacity', 1);
+      hide();
+      e.preventDefault();
+    });
   }
+
+  window.addEventListener('mousemove', e => {
+    if (!dragCtx || !dragCtx.dragging) return;
+    const px = dragCtx.toPlotX(e.clientX);
+    dragCtx.selRect.setAttribute('x', Math.min(dragCtx.startPx, px));
+    dragCtx.selRect.setAttribute('width', Math.abs(px - dragCtx.startPx));
+  });
+  window.addEventListener('mouseup', e => {
+    if (!dragCtx || !dragCtx.dragging) return;
+    dragCtx.dragging = false;
+    const px = dragCtx.toPlotX(e.clientX);
+    dragCtx.selRect.setAttribute('opacity', 0);
+    const pxA = Math.min(dragCtx.startPx, px), pxB = Math.max(dragCtx.startPx, px);
+    if (pxB - pxA < 6 || !dragCtx.onRangeSelect) return;   // arraste mínimo p/ evitar clique acidental
+    const i0 = dragCtx.nearestPx(pxA), i1 = dragCtx.nearestPx(pxB);
+    if (i0 === i1) return;
+    dragCtx.onRangeSelect(dragCtx.points[i0][0], dragCtx.points[i1][0]);
+  });
 
   function render(){
     const d=MACRO_DATA[state.key]; if(!d) return;
@@ -1396,13 +1471,20 @@ _CHART_JS = r"""
       : 'Fonte: '+d.source;
     if (d.analiseIA) { elIA.textContent = d.analiseIA; elIA.style.display = 'block'; }
     else { elIA.textContent = ''; elIA.style.display = 'none'; }
-    ranges.querySelectorAll('button').forEach(b =>
-      b.classList.toggle('ativo', Number(b.dataset.m)===state.months));
-    drawChart(filtrar(d.series, state.months), d.unit, d.decimals);
+    ranges.querySelectorAll('button[data-m]').forEach(b =>
+      b.classList.toggle('ativo', !state.customRange && Number(b.dataset.m)===state.months));
+    if (elClear) elClear.style.display = state.customRange ? 'inline-block' : 'none';
+    const pts = state.customRange
+      ? filtrarRange(d.series, state.customRange.start, state.customRange.end)
+      : filtrar(d.series, state.months);
+    drawChart(pts, d.unit, d.decimals, (startIso, endIso) => {
+      state.customRange = { start: startIso, end: endIso };
+      render();
+    });
   }
   function open(key){
     if(!MACRO_DATA[key]) return;
-    state.key=key; state.months=MONTHS_DEFAULT;
+    state.key=key; state.months=MONTHS_DEFAULT; state.customRange=null;
     modal.classList.add('aberto'); modal.setAttribute('aria-hidden','false');
     document.body.style.overflow='hidden'; render();
   }
@@ -1417,8 +1499,9 @@ _CHART_JS = r"""
       if(e.key==='Enter'||e.key===' '){ e.preventDefault(); open(card.dataset.key); }
     });
   });
-  ranges.querySelectorAll('button').forEach(b =>
-    b.addEventListener('click', () => { state.months=Number(b.dataset.m); render(); }));
+  ranges.querySelectorAll('button[data-m]').forEach(b =>
+    b.addEventListener('click', () => { state.months=Number(b.dataset.m); state.customRange=null; render(); }));
+  if (elClear) elClear.addEventListener('click', () => { state.customRange=null; render(); });
   modal.querySelectorAll('[data-close]').forEach(x => x.addEventListener('click', close));
   document.addEventListener('keydown', e => { if(e.key==='Escape') close(); });
 })();
@@ -1569,8 +1652,10 @@ def gerar_html(materias: list[Materia], macro: list[Indicador], hoje: dt.date) -
     border-radius: 8px; padding: 6px 14px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all .12s; }}
   .ranges button:hover {{ color: var(--texto); border-color: var(--azul); }}
   .ranges button.ativo {{ background: var(--azul); color: #fff; border-color: var(--azul); }}
+  .ranges button.limpar {{ margin-left: auto; }}
   .chart-wrap {{ width: 100%; }}
-  .chart-wrap svg {{ width: 100%; height: auto; display: block; }}
+  .chart-wrap svg {{ width: 100%; height: auto; display: block; cursor: crosshair; }}
+  .chart-dica {{ color: var(--neutro); font-size: 11.5px; margin: 8px 0 0; }}
   .modal-ia {{ margin-top: 14px; padding: 12px 14px; background: var(--surface-2);
     border: 1px solid var(--linha); border-left: 3px solid var(--azul); border-radius: 8px;
     color: #cdd3dd; font-size: 13.5px; line-height: 1.5; }}
@@ -1655,11 +1740,13 @@ def gerar_html(materias: list[Materia], macro: list[Indicador], hoje: dt.date) -
         <button data-m="6">6M</button>
         <button data-m="12">12M</button>
         <button data-m="24">24M</button>
+        <button id="clear-range" class="limpar" style="display:none">✕ limpar seleção</button>
       </div>
       <div class="chart-wrap">
         <svg id="chart" viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet"
              role="img" aria-label="Gráfico histórico do indicador"></svg>
       </div>
+      <p class="chart-dica">Arraste sobre o gráfico para selecionar visualmente um período personalizado.</p>
       <div class="modal-ia" id="modal-ia" style="display:none"></div>
       <div class="modal-fonte" id="modal-fonte"></div>
     </div>
