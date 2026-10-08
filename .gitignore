@@ -2,4 +2,4 @@ briefings/
 .vscode/
 __pycache__/
 .venv/
-.gitignore
+.ipynb_checkpoints/
